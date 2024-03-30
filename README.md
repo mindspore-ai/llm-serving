@@ -1,6 +1,6 @@
-# MindSpore Serving
+# MindSpore LLM-Serving
 
-### serving is a fast and easy-to-use inference framework
+### serving is a fast and easy-to-use LLM inference framework
 
 ---
 ### Features
