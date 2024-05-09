@@ -791,15 +791,19 @@ class WorkAgent:
         predict_time = time.time()
         if self.mindspore_model.config.use_past:
             logging.debug(f"predict before pa predict_for_kbk.")
-            if self.is_prefill:
-                self.mindspore_model.is_first_iteration = True
-            res, current_index = self.mindspore_model.forward(input_ids=input_ids,
-                                                    valid_length_each_example=valid_length,
-                                                    generation_config=self.mindspore_model.config,
-                                                    block_tables=block_tables,
-                                                    slot_mapping=slot_mapping,
-                                                    prefill=self.is_prefill,
-                                                    **model_kwargs)
+            if self.config.model_config.page_attention:
+                logging.debug(f"predict before model predict_for_kbk.")
+                if self.is_prefill:
+                    self.mindspore_model.is_first_iteration = True
+                res = self.mindspore_model._incremental_kbk_infer(model_inputs=model_inputs,
+                                                                  current_index=current_index,
+                                                                  valid_length_each_example=valid_length,
+                                                                  block_tables=block_tables,
+                                                                  slot_mapping=slot_mapping)
+            else:
+                res = self.mindspore_model._incremental_infer(model_inputs=model_inputs,
+                                                              current_index=current_index,
+                                                              valid_length_each_example=valid_length)
         else:
             res = self.mindspore_model(**model_inputs)
         logging.info('predict time is {}'.format((time.time() - predict_time) * 1000))
