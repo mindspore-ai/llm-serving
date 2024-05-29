@@ -1,4 +1,5 @@
 import time
+import math
 from typing import List, Tuple, Deque
 import logging
 
@@ -9,6 +10,18 @@ from mindspore_serving.serving_utils.entry import EntryMetaData, EntryStatus, En
 from mindspore_serving.config.config import ServingConfig
 from mindspore_serving.schedule.cache_engine import ServingBlockMemPool, ServingCacheEngine
 
+class FastserveMulQue:
+    """fastserve multil waitting request queue"""
+    def __init__(self, time):
+        self.waiting_request_queue: Deque[EntryMetaData] = Deque([])
+        self.time = time
+
+class Priority(Enum):
+    ZERO = 0
+    ONE = 1
+    TWO = 2
+    THREE = 3
+    FOUR = 4
 
 class Schedule:
     """static batch strategy"""
@@ -27,6 +40,22 @@ class Schedule:
         # batch中有效token的最大index, 初始化为-1
         self.max_valid_index = -1
         self.dyn_batch = config.model_config.decode_batch_size
+        # for fastserve batching
+        if config.model_config.fastserve:
+            self.exec_time_slice = config.fa_config.time_slice
+            # 最高优先级等待队列的执行时间片，后面每个次优先级等待队列的执行时间片是之前的rate倍
+            # 总共5个优先级等待队列 ：
+            # self.waiting_request_queue是最高优先级等待队列
+            # self.queue_list存放6个次优先级等待队列
+            # 但其中优先级最低的2个队列只用于接收被反复降级的请求，保证其得到较长时间片而不会被反复抢占、降级
+            self.queue_list = [FastserveMulQue(self.exec_time_slice*(config.fa_config.rate**(i+1))) for i in range(6)]
+            self.waiting_time = config.fa_config.starve_waiting_time
+            self.starve_times = {}
+            self.index_priority = {}
+            self.entry_in_host = []
+            self.start_times = {}
+            self.new_insert_entry = set()
+
 
     def get_dyn_batch(self):
         return self.batch_size
@@ -37,6 +66,24 @@ class Schedule:
     def add_entrys(self, entry_meta_data: EntryMetaData):
         entry_meta_data.get_entry_data().set_status(EntryStatus.WAITING)
         self.waiting_request_queue.append(entry_meta_data)
+
+    def cal_enset_priority(self, prompt_len):
+        priority = math.ceil(math.log2(prompt_len / 10))
+        if priority < 0:
+            priority = 0
+        return Priority(min(priority, 4))
+
+    def add_entrys_fa(self, entry_meta_data: EntryMetaData):
+        entry_meta_data.get_entry_data().set_status(EntryStatus.WAITING)
+        prompt_len = entry_meta_data.entry_data.get_prompt_len()
+        priority = self.cal_enset_priority(prompt_len)
+        if priority ==  Priority.ZERO:
+            self.waiting_request_queue.append(entry_meta_data)
+        else:
+            self.queue_list[priority.value - 1].waiting_request_queue.append(entry_meta_data)
+        self.starve_times[entry_meta_data.request_id] = time.time()
+        self.index_priority[entry_meta_data.request_id] = priority.value
+        self.start_times[entry_meta_data.request_id] = time.time()
 
     def _padding_batch_size(self):
         while len(self.running_request_list) < self.batch_size:
@@ -261,6 +308,8 @@ class Schedule:
             data.get_entry_data().set_status(EntryStatus.RUNNING)
         data.get_entry_data().set_decode_index(index)
         self.running_request_list[index] = data
+        if self.config.model_config.fastserve:
+            self.new_insert_entry.add(data.request_id)
         logging.debug(f'add new valid request in batch, batch size index is {index}')
 
     def try_substitute_entry(self):
@@ -377,6 +426,262 @@ class Schedule:
         # logging.debug("inserting padding to popped entry %s", index_to_swap)
         self.insert_padding_entry(index_to_swap)
 
+    def check_entry_in_host(self):
+        now = time.time()
+        for entry, enst in self.entry_in_host:
+            if now - self.starve_times[entry.request_id] + enst >= self.waiting_time:
+                if entry.cache_engine.try_use_budget(entry.get_entry_data().get_len()):
+                    self.waiting_request_queue.appendleft(entry)
+                    self.starve_times[entry.request_id] = time.time()
+                    self.index_priority[entry.request_id] = 0
+
+    #后续需修改，对max_enst_entry进行swap或release
+    def find_max_enst_entry(self):
+        max_enst_entry = [None for _ in range(2)]
+        max_enst = [0 for _ in range(2)]
+
+        for data in self.waiting_request_queue:
+            enst = self.cal_enst(data)
+            if enst > max_enst[0]:
+                max_enst[0] = enst
+                max_enst_entry[0] = data
+
+        que_index = 0  
+        for index, que in enumerate(self.queue_list):
+            for data in que.waiting_request_queue:
+                enst = self.cal_enst(data)
+                if enst > max_enst[1]:
+                    max_enst[1] = enst
+                    max_enst_entry[1] = data
+                    que_index = index
+        
+        flag = 1 if max_enst[0] <= max_enst[1] else 0
+
+
+        if flag == 0 and max_enst_entry[0] != None:
+            max_enst_entry[0].get_entry_data().set_status(EntryStatus.WAITING)
+            max_enst_entry[0].is_prompt = True
+            max_enst_entry[0].cache_engine.release_cache()
+            self.starve_times[max_enst_entry[0].request_id] = time.time()
+            self.entry_in_host.append((max_enst_entry[0],max_enst[0]))
+            self.index_priority.pop(max_enst_entry[0].request_id, None)
+            count = 0
+            que_len = len(self.waiting_request_queue)
+            while len(self.waiting_request_queue) != 0:
+                data = self.waiting_request_queue.popleft()
+                if data.request_id != max_enst_entry[0].request_id:
+                    self.waiting_request_queue.append(data)
+                else:
+                    break
+                count += 1
+                if count == que_len:
+                    break
+        elif flag == 1 and max_enst_entry[1] != None:
+            max_enst_entry[1].get_entry_data().set_status(EntryStatus.WAITING)
+            max_enst_entry[1].is_prompt = True
+            max_enst_entry[1].cache_engine.release_cache()
+            self.starve_times[max_enst_entry[1].request_id] = time.time()
+            self.entry_in_host.append((max_enst_entry[1], max_enst[1]))
+            self.index_priority.pop(max_enst_entry[1].request_id, None)
+            count = 0
+            que_len = len(self.queue_list[que_index].waiting_request_queue)
+            while len(self.queue_list[que_index].waiting_request_queue) != 0:
+                data = self.queue_list[que_index].waiting_request_queue.popleft()
+                if data.request_id != max_enst_entry[1].request_id:
+                    self.queue_list[que_index].waiting_request_queue.append(data)
+                else:
+                    break
+                count += 1
+                if count == que_len:
+                    break
+
+    #往最高优先级等待队列补充一条请求，如果最高优先级等待队列为空的话
+    def _refresh_queue_list(self):
+        #优先处理饥饿请求
+        self.promote_starved_jobs()
+
+        #补充最高优先级队列的请求
+        if len(self.waiting_request_queue) >= 1:
+            return 
+        padding_size = 1
+        if padding_size > 0:
+            count = 0
+            for index, ele in enumerate(self.queue_list):
+                while len(ele.waiting_request_queue) != 0 and count < padding_size:
+                    data = ele.waiting_request_queue.popleft()
+                    self.waiting_request_queue.append(data)
+                    count += 1
+                if count == padding_size:
+                    break
+
+    def try_substitute_entry_fastserve(self):
+        checkout_list = []
+        for index, data in enumerate(self.running_request_list):
+            # 0 for FINISHED_LENGTH_CAPPED、FINISHED_STOPPED、PADDING_INVAILED, 
+            # 1 for RUNNING
+            # 2 for else
+            check_ = 2
+            if data.get_entry_data().get_status() == EntryStatus.RUNNING:
+                index = self.index_priority.get(data.request_id)
+                if index == None:
+                    index = self.cal_enset_priority(data.entry_data.get_prompt_len())
+                now = time.time()
+                if index == 0 and now - self.start_times[data.request_id] > self.exec_time_slice:
+                    check_ = 1
+                if index != 0 and now - self.start_times[data.request_id] > self.queue_list[index-1].time:
+                    check_ = 1
+            elif data.get_entry_data().get_status() == EntryStatus.FINISHED_LENGTH_CAPPED:
+                check_ = 0
+                self.starve_times.pop(data.request_id, None)
+                self.index_priority.pop(data.request_id, None)
+                self.start_times.pop(data.request_id, None)
+            elif data.get_entry_data().get_status() == EntryStatus.FINISHED_STOPPED:
+                check_ = 0
+                self.starve_times.pop(data.request_id, None)
+                self.index_priority.pop(data.request_id, None)
+                self.start_times.pop(data.request_id, None)
+            elif data.get_entry_data().get_status() == EntryStatus.PADDING_INVAILED:
+                check_ = 0
+                self.starve_times.pop(data.request_id, None)
+                self.index_priority.pop(data.request_id, None)
+                self.start_times.pop(data.request_id, None)
+            checkout_list.append(check_)
+        flag = True
+        swap_index_list = []
+        for index, check in enumerate(checkout_list):
+            if check == 0 or check == 1:
+                flag = False
+                swap_index_list.append((index, check))
+        if flag:
+            return False
+        # 如果有空槽位，尝试替代一条新请求：
+        swap_index_list = sorted(swap_index_list, key=lambda x: x[1])
+        index_to_substitute = swap_index_list[0][0]
+        self._refresh_queue_list()
+        new_entry = self.waiting_request_queue[0]
+        flag_try_use_budget = False
+        if new_entry.cache_engine.try_use_budget(new_entry.get_entry_data().get_len() if new_entry.is_prompt == True else 1):
+            flag_try_use_budget = True
+        if flag_try_use_budget:
+            #如果swap的是非法请求
+            if swap_index_list[0][1] == 0:
+                self._insert_new_prompt_to_batch_pa(index_to_substitute)
+                return True
+            #如果swap的是running请求
+            else:
+                if self.update_entry_status(self.running_request_list[index_to_substitute]):
+                    self._insert_new_prompt_to_batch_pa(index_to_substitute)
+                    return True
+                else:
+                    logging.debug("update失败，无法抢占请求")
+                    return False
+        # 如果空间不足，那么连第一条waiting的请求就无法替换，直接退出
+        return False
+
+    # Promote starved jobs
+    def promote_starved_jobs(self):
+        for key, value in self.starve_times.items():
+            if time.time() - value > self.waiting_time:
+                index = self.index_priority[key]
+                if index == 0:
+                    continue
+                else:
+                    count = 0
+                    que_len = len(self.queue_list[index-1].waiting_request_queue)
+                    while len(self.queue_list[index-1].waiting_request_queue) != 0:
+                        data = self.queue_list[index-1].waiting_request_queue.popleft()
+                        if data.request_id != key:
+                            self.queue_list[index-1].waiting_request_queue.append(data)
+                        else:
+                            self.starve_times[data.request_id] = time.time()
+                            self.waiting_request_queue.append(data)
+                            break
+                        count += 1
+                        if count == que_len:
+                            break
+                    
+                    
+    
+    # 对执行队列中的request决定是否降低优先级，重新设置优先级，暂时默认降低一级, 需修改
+    def update_entry_status(self, entry_meta_data: EntryMetaData):
+        if entry_meta_data == None:
+            return False
+        index_pre = self.index_priority.get(entry_meta_data.request_id)
+        if index_pre == None:
+            index_pre = self.cal_enset_priority(entry_meta_data.get_entry_data.get_prompt_len())
+        self.start_times[entry_meta_data.request_id] = time.time()
+        index_next = index_pre + 1
+        if index_next >= len(self.queue_list):
+            index_next = len(self.queue_list) - 1
+        self.index_priority[entry_meta_data.request_id] = index_next
+        entry_meta_data.get_entry_data().set_status(EntryStatus.RUNNING)
+        entry_meta_data.get_entry_data().set_decode_index(0)
+        self.queue_list[index_next-1].waiting_request_queue.appendleft(entry_meta_data)
+        self.starve_times[entry_meta_data.request_id] = time.time()
+        return True
+
+    #单个请求从等待队列pre到next需要的时间
+    def exec_time(self, pre, next):
+        res = 0
+        for i in range(pre, next):
+            res += self.queue_list[pre].time
+        return res
+
+
+    def cal_enst(self, entry_meta_data: EntryMetaData):
+        priority = self.index_priority[entry_meta_data.request_id]
+        exec_time = 0
+        # # #最高优先级 priority = 0
+        # # #第二优先级 priority = 1, 在self.queue_list中的index为 priority - 1
+        
+        if priority > 0:
+            exec_time += len(self.waiting_request_queue) * 1
+            exec_time += len(self.waiting_request_queue) * self.exec_time(0, priority-1)
+            for i in range(0, priority-1):
+                exec_time += len(self.queue_list[i].waiting_request_queue) * self.exec_time(i, priority-1)
+        # #饥饿调度剩余时间
+        now = time.time()
+        near_starve_time = 0 if now - self.starve_times[entry_meta_data.request_id] > self.waiting_time else self.waiting_time - (now - self.starve_times[entry_meta_data.request_id])
+        return min(exec_time, near_starve_time)
+
+
+    def _continuous_batch_fastserve(self):
+        start_time = time.time()
+        #每次迭代之前，判断内存里的entry是否会在本次迭代执行，如果是，放回NPU里
+        self.check_entry_in_host()
+
+        ServingBlockMemPool.instance().reset_budget()
+        # ServingBlockMemPool.instance().log_status()
+        self.try_initialize_paddings_pa()
+        # 判断batch内的running entry，能否进行本轮推理？
+        num_entry_swapped_out = 0
+        while not self.can_predict_current_batch():
+            # 如果不能，swap出去已有请求
+            self.reset_all_budgets()
+            self.find_max_enst_entry()
+            num_entry_swapped_out += 1
+        if num_entry_swapped_out:
+            self.reset_all_budgets()
+            return
+        # 3. 处理新请求
+        self._refresh_queue_list()
+        self.new_insert_entry.clear()
+        while self.waiting_request_queue:
+            # 如果有空batch槽，尝试插入
+            if not self.try_substitute_entry_fastserve():
+                # 尝试失败，退出
+                break
+            self._refresh_queue_list()
+
+        self.reset_all_budgets()
+
+        end_time = time.time()
+        iter_time = end_time - start_time
+        for key, value in self.start_times.items():
+            self.start_times[key] = value + iter_time
+        for id in self.new_insert_entry:
+            self.start_times[id] = end_time
+
     def _continuous_batch_pa(self):
         ServingBlockMemPool.instance().reset_budget()
         # ServingBlockMemPool.instance().log_status()
@@ -419,6 +724,8 @@ class Schedule:
             self._static_batch()
         elif not self.config.model_config.page_attention and self.batching_strategy == 'continuous':
             self._continuous_batch()
+        elif self.config.model_config.fastserve:
+            self._continuous_batch_fastserve()
         elif self.config.model_config.page_attention:  # 加入PA
             self._continuous_batch_pa()
         else:

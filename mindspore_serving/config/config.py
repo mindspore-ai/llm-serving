@@ -33,6 +33,8 @@ def check_valid_config(config):
         model_config['current_index'] = False
     if model_config.page_attention is None:
         model_config['page_attention'] = False
+    if model_config.fastserve is None:
+        model_config['fastserve'] = False
     if model_config.backend is None:
         model_config['backend'] = 'ge'
 
@@ -44,6 +46,24 @@ def check_valid_config(config):
             pa_config['num_blocks'] = 224
             pa_config['block_size'] = 128
             pa_config['decode_seq_length'] = 4096
+
+    #   # fa_config校验
+    if model_config.fastserve:
+        if config.fa_config is None:
+            config.fa_config ={}
+            fa_config = config.fa_config
+            fa_config['time_slice'] = 0.3
+            fa_config['rate'] = 1.5
+            fa_config['starve_waiting_time'] = 10
+        # fa需要对kv cache进行操作，所以要开启pa
+        if model_config.page_attention is None or model_config.page_attention is False:
+            model_config['page_attention'] = True
+            if config.pa_config is None:
+                config.pa_config ={}
+                pa_config = config.pa_config
+                pa_config['num_blocks'] = 224
+                pa_config['block_size'] = 128
+                pa_config['decode_seq_length'] = 4096
 
     # serving_config校验
     serving_config = config.serving_config
