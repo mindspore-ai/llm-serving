@@ -23,6 +23,7 @@ model_config:
     batching_strategy: 'continuous'
     current_index: False
     page_attention: True
+    fastserve: False
     model_dtype: "DataType.FLOAT32"
     pad_token_id: 0
     backend: 'kbk' # 'ge'
@@ -38,6 +39,17 @@ pa_config:
     num_blocks: 2048
     block_size: 16
     decode_seq_length: 4096
+
+fa_config:
+    time_slice: 5
+    rate: 1.5
+    starve_waiting_time: 10
+    use_predictor: False
+    predictor_ckpt_path: ""
+    prompt_weight: 0.6
+    decode_weight: 0.4
+    device_target: "CPU"
+    device_id: 0
 
 tokenizer:
     type: LlamaTokenizer

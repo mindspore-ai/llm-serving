@@ -64,6 +64,17 @@ def check_valid_config(config):
                 pa_config['num_blocks'] = 224
                 pa_config['block_size'] = 128
                 pa_config['decode_seq_length'] = 4096
+        # 对预测器参数检测
+        if config.fa_config.use_predictor:
+            if not (config.fa_config.predictor_ckpt_path and os.path.exists(config.fa_config.predictor_ckpt_path)):
+                print("ERROR: When the configuration item use_predictor in FA is true, predictor_ckpt_path must be a valid path")
+                return False
+            if not (config.fa_config.device_target in ("CPU", "GPU", "Ascend")):
+                print("ERROR: not support device {}".format(config.fa_config.device))
+                return False
+            if config.fa_config.device_id < 0:
+                print("ERROR: not support device_id {}".format(config.fa_config.device_id))
+                return False
 
     # serving_config校验
     serving_config = config.serving_config

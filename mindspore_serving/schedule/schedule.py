@@ -9,6 +9,7 @@ from mindspore_serving.serving_utils.constant import *
 from mindspore_serving.serving_utils.entry import EntryMetaData, EntryStatus, EntryData
 from mindspore_serving.config.config import ServingConfig
 from mindspore_serving.schedule.cache_engine import ServingBlockMemPool, ServingCacheEngine
+from mindspore_serving.schedule.bert_predictor import Predictor
 
 class FastserveMulQue:
     """fastserve multil waitting request queue"""
@@ -42,6 +43,11 @@ class Schedule:
         self.dyn_batch = config.model_config.decode_batch_size
         # for fastserve batching
         if config.model_config.fastserve:
+            if config.fa_config.use_predictor:
+                self.predictor = Predictor(hidden_dim=128, num_classes=5, model_name="bert_base_uncased", 
+                                           ckpt_path=config.fa_config.predictor_ckpt_path, 
+                                           device_target=config.fa_config.device_target,
+                                           device_id=config.fa_config.device_id)
             self.exec_time_slice = config.fa_config.time_slice
             # 最高优先级等待队列的执行时间片，后面每个次优先级等待队列的执行时间片是之前的rate倍
             # 总共5个优先级等待队列 ：
@@ -76,7 +82,16 @@ class Schedule:
     def add_entrys_fa(self, entry_meta_data: EntryMetaData):
         entry_meta_data.get_entry_data().set_status(EntryStatus.WAITING)
         prompt_len = entry_meta_data.entry_data.get_prompt_len()
-        priority = self.cal_enset_priority(prompt_len)
+        prompt_priority = self.cal_enset_priority(prompt_len)
+        if self.config.fa_config.use_predictor:
+            predictor_priority = self.predictor.predict(question=entry_meta_data.prompt) 
+            priority = math.floor(self.config.fa_config.prompt_weight * prompt_priority.value + 
+                                  self.config.fa_config.decode_weight * predictor_priority)
+            priority = Priority(priority)
+            logging.info("prompt_priority: {}, predictor_priority: {}, last priority: {}".format(prompt_priority.value, predictor_priority, priority.value))
+        else:
+            logging.info("prompt priority: {}, last priority: {}".format(prompt_priority.value, prompt_priority.value))
+        
         if priority ==  Priority.ZERO:
             self.waiting_request_queue.append(entry_meta_data)
         else:
