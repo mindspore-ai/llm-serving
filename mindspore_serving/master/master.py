@@ -274,7 +274,10 @@ class Master:
                                         block_size=block_size)
 
         logging.debug("add request to schedule queue {}".format(entry_meta_data.request_id))
-        self.scheduler.add_entrys(entry_meta_data)
+        if self.config.model_config.fastserve:
+            self.scheduler.add_entrys_fa(entry_meta_data)
+        else:
+            self.scheduler.add_entrys(entry_meta_data)
 
     def step(self) -> List[ResponseOutput]:
         # do inference
